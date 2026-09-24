@@ -19,6 +19,14 @@ from .core import (
     QNORM_TOL,
     MAX_BONES,
 )
+from .hierarchy import (
+    PoseNode,
+    GlobalPose,
+    resolve_global_poses,
+    skin_named,
+    QUAT_NORMALIZE_REJECT,
+    QUAT_NORMALIZE_NORMALIZE,
+)
 
 __all__ = [
     "Bone",
@@ -34,4 +42,10 @@ __all__ = [
     "skin",
     "QNORM_TOL",
     "MAX_BONES",
+    "PoseNode",
+    "GlobalPose",
+    "resolve_global_poses",
+    "skin_named",
+    "QUAT_NORMALIZE_REJECT",
+    "QUAT_NORMALIZE_NORMALIZE",
 ]
