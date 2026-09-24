@@ -1,4 +1,5 @@
-"""dqskin 演示：扭转区域双四元数蒙皮 vs 线性混合，以及错误输入拒绝。
+"""dqskin 演示：扭转区域双四元数蒙皮 vs 线性混合、局部姿态 -> 全局姿态
+-> 蒙皮的新入口，以及错误输入拒绝。
 
 固定输入、确定性计算、离线运行（约 1 秒内完成）。
 """
@@ -7,7 +8,18 @@ from __future__ import annotations
 
 import math
 
-from dqskin import Bone, Quat, RigidTransform, Vec3, WeightError, skin
+from dqskin import (
+    Bone,
+    HierarchyError,
+    PoseNode,
+    Quat,
+    RigidTransform,
+    Vec3,
+    WeightError,
+    compute_global_pose,
+    skin,
+    skin_with_pose,
+)
 
 
 def quat_axis_angle(axis, angle):
@@ -78,6 +90,69 @@ def main() -> None:
         print("（意外）未触发拒绝")
     except WeightError as exc:
         print(f"已拒绝 -> WeightError: {exc}")
+
+    # ==== 新能力：局部姿态 + 父节点 -> 拓扑排序求全局姿态 -> 旧蒙皮入口 ====
+    print()
+    print("=== 局部姿态入口：三层骨架（root -> mid -> leaf）===")
+    ident_q = Quat(1.0, 0.0, 0.0, 0.0)
+
+    def shift_x(d):
+        return RigidTransform(ident_q, Vec3(d, 0.0, 0.0))
+
+    # 绑定姿态：三节骨架沿 x 轴各平移 1（leaf 绑定世界位置 (2,0,0)）
+    bind_pose = [
+        PoseNode("root", None, shift_x(0.0)),
+        PoseNode("mid", "root", shift_x(1.0)),
+        PoseNode("leaf", "mid", shift_x(1.0)),
+    ]
+    # 当前姿态：root 绕 z 轴转 90°，子节点局部变换不变
+    current_pose = [
+        PoseNode("root", None,
+                 RigidTransform(quat_axis_angle((0, 0, 1), math.pi / 2), Vec3(0, 0, 0))),
+        PoseNode("mid", "root", shift_x(1.0)),
+        PoseNode("leaf", "mid", shift_x(1.0)),
+    ]
+
+    globals_cur = compute_global_pose(current_pose)
+    print("拓扑序（父先于子）:", " -> ".join(globals_cur))
+    for name, g in globals_cur.items():
+        t = g.translation
+        print(f"  {name:4s} 全局位置 = ({t.x:+.6f}, {t.y:+.6f}, {t.z:+.6f})")
+
+    # 蒙皮：leaf 末端顶点随父节点旋转从 (2,0,0) 到 (0,2,0)
+    res = skin_with_pose(
+        [((2.0, 0.0, 0.0), (0.0, 0.0, 1.0))],
+        bind_pose,
+        current_pose,
+        [[(2, 1.0)]],
+    )
+    p = res[0].position
+    print(f"leaf 末端顶点蒙皮结果 = ({p.x:+.6f}, {p.y:+.6f}, {p.z:+.6f})")
+
+    # ---- 边界：输入顺序打乱（子先于父），拓扑排序后结果一致 ----
+    print()
+    print("=== 边界：输入顺序打乱（leaf 最先）===")
+    shuffled = [bind_pose[2], bind_pose[0], bind_pose[1]]
+    g2 = compute_global_pose(shuffled)
+    t = g2["leaf"].translation
+    print(f"打乱后拓扑序: {' -> '.join(g2)}；leaf 绑定全局位置 = "
+          f"({t.x:+.6f}, {t.y:+.6f}, {t.z:+.6f})")
+
+    # ---- 拒绝：重复绑定与环 ----
+    print()
+    print("=== 拒绝边界：重复绑定与环 ===")
+    try:
+        compute_global_pose([PoseNode("a", None, bind_pose[0].local),
+                             PoseNode("a", None, bind_pose[0].local)])
+        print("（意外）未触发拒绝")
+    except HierarchyError as exc:
+        print(f"已拒绝 -> HierarchyError: {exc}")
+    try:
+        compute_global_pose([PoseNode("a", "b", bind_pose[0].local),
+                             PoseNode("b", "a", bind_pose[0].local)])
+        print("（意外）未触发拒绝")
+    except HierarchyError as exc:
+        print(f"已拒绝 -> HierarchyError: {exc}")
 
 
 if __name__ == "__main__":

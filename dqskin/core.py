@@ -10,12 +10,21 @@
 - 顶点混合：以最大权重骨骼的实部为符号基准，实部内积为负的骨骼整体翻转
   （实部与对偶部同号翻转），加权求和后单位化（正交化），再作用于位置与法向。
 
+姿态节点入口（新增）：
+- PoseNode(name, parent, local)：以名字标识的局部刚体变换 + 父节点名。
+- compute_global_pose(nodes)：拓扑排序后沿父链累乘求全局姿态；
+  固定的规范化规则——每次累乘后立即将旋转四元数单位化（除以其模长），
+  不做符号翻转等其他处理。
+- skin_with_pose(vertices, bind_pose, current_pose, weights)：分别求绑定/
+  当前全局姿态，构造等价骨骼列表交给旧蒙皮入口 skin。
+
 所有校验在计算前完成：任一输入非法时抛出异常，不返回部分结果。
 """
 
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import NamedTuple, Sequence
 
 __all__ = [
@@ -23,6 +32,7 @@ __all__ = [
     "Quat",
     "RigidTransform",
     "Bone",
+    "PoseNode",
     "SkinResult",
     "SkinError",
     "InvalidInputError",
@@ -30,6 +40,8 @@ __all__ = [
     "NonRigidTransformError",
     "WeightError",
     "skin",
+    "compute_global_pose",
+    "skin_with_pose",
     "QNORM_TOL",
     "MAX_BONES",
 ]
@@ -93,7 +105,17 @@ class SkinResult(NamedTuple):
     normal: Vec3
 
 
-# ---------------------------------------------------------------------------
+class PoseNode(NamedTuple):
+    """姿态节点：以名字标识的局部刚体变换（新增能力）。
+
+    name   —— 任意可哈希标识，同一姿态内唯一（重名即“重复绑定”，拒绝）。
+    parent —— 父节点的 name，根节点为 None。
+    local  —— 相对父节点的局部刚体变换；旋转四元数必须单位（QNORM_TOL）。
+    """
+
+    name: object
+    parent: object  # None 或父节点的 name；运行期严格校验
+    local: RigidTransform# ---------------------------------------------------------------------------
 # 错误类型（均可定位：消息中带 bones[i] / vertices[i] / weights[i][j] 等路径）
 # ---------------------------------------------------------------------------
 
@@ -425,6 +447,150 @@ def _dq_translation(qr: Quat, qd: Quat) -> Vec3:
 
 
 # ---------------------------------------------------------------------------
+# 姿态节点：局部变换 + 父节点 -> 拓扑排序 -> 全局姿态
+# ---------------------------------------------------------------------------
+
+
+def _check_hashable(value: object, where: str) -> None:
+    try:
+        hash(value)
+    except TypeError:
+        raise InvalidInputError(f"{where}: 需要可哈希标识，得到 {value!r}") from None
+
+
+def _parse_pose_nodes(nodes: object, where: str) -> list[PoseNode]:
+    """解析姿态节点序列；校验结构、数值与旋转单位性（拓扑校验在 _topo_sort）。"""
+    if not isinstance(nodes, (tuple, list)):
+        raise InvalidInputError(f"{where}: 需要序列，得到 {type(nodes).__name__}")
+    if len(nodes) == 0:
+        raise HierarchyError(f"{where}: 至少需要 1 个姿态节点")
+    parsed: list[PoseNode] = []
+    for i, nd in enumerate(nodes):
+        w = f"{where}[{i}]"
+        if isinstance(nd, PoseNode):
+            name, parent, local = nd.name, nd.parent, nd.local
+        elif isinstance(nd, (tuple, list)) and len(nd) == 3:
+            name, parent, local = nd
+        elif isinstance(nd, dict):
+            try:
+                name = nd["name"]
+                parent = nd["parent"]
+                local = nd["local"]
+            except KeyError as exc:
+                raise InvalidInputError(f"{w}: 缺少键 {exc}") from None
+        else:
+            raise InvalidInputError(
+                f"{w}: 需要 PoseNode、(name, parent, local) 或 dict，得到 {nd!r}"
+            )
+        _check_hashable(name, f"{w}.name")
+        if parent is not None:
+            _check_hashable(parent, f"{w}.parent")
+        parsed.append(
+            PoseNode(name=name, parent=parent, local=_parse_rigid(local, f"{w}.local"))
+        )
+    return parsed
+
+
+def _topo_sort(nodes: list[PoseNode], where: str) -> list[PoseNode]:
+    """Kahn 拓扑排序（父先于子）；拒绝重复绑定、非法父节点、自环与环。
+
+    顺序确定性：根按输入序入队，同一父节点的子节点按输入序出队。
+    """
+    first_index: dict[object, int] = {}
+    for i, nd in enumerate(nodes):
+        if nd.name in first_index:
+            raise HierarchyError(
+                f"{where}: 节点名 {nd.name!r} 重复绑定"
+                f"（第 {first_index[nd.name]} 与第 {i} 项）"
+            )
+        first_index[nd.name] = i
+
+    children: dict[object, list[PoseNode]] = {nd.name: [] for nd in nodes}
+    roots: list[PoseNode] = []
+    for i, nd in enumerate(nodes):
+        if nd.parent is None:
+            roots.append(nd)
+            continue
+        if nd.parent == nd.name:
+            raise HierarchyError(
+                f"{where}[{i}].parent: 节点不能以自己为父（自环）"
+            )
+        if nd.parent not in children:
+            raise HierarchyError(
+                f"{where}[{i}].parent: 父节点 {nd.parent!r} 不存在（非法父节点）"
+            )
+        children[nd.parent].append(nd)
+
+    order: list[PoseNode] = []
+    queue = deque(roots)
+    while queue:
+        nd = queue.popleft()
+        order.append(nd)
+        queue.extend(children[nd.name])
+    if len(order) != len(nodes):
+        done = {nd.name for nd in order}
+        stuck = [nd.name for nd in nodes if nd.name not in done]
+        raise HierarchyError(f"{where}: 父链存在环，涉及节点 {stuck!r}")
+    return order
+
+
+def _qnormalize(q: Quat) -> Quat:
+    """单位化 q / ‖q‖（固定的规范化规则的唯一环节）。"""
+    n = math.sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z)
+    if n == 0.0:
+        # 输入已校验为单位四元数，乘积不会坍缩到 0；防御性兜底。
+        raise SkinError("内部错误：四元数模长为零，无法规范化")
+    inv = 1.0 / n
+    return Quat(q.w * inv, q.x * inv, q.y * inv, q.z * inv)
+
+
+def _compose_global(parent: RigidTransform, local: RigidTransform) -> RigidTransform:
+    """全局累乘 W = W_parent · L；旋转乘积立即单位化（固定规范化规则）。"""
+    return RigidTransform(
+        rotation=_qnormalize(_qmul(parent.rotation, local.rotation)),
+        translation=_vadd(_qrot(parent.rotation, local.translation), parent.translation),
+    )
+
+
+def _globals_from_order(order: list[PoseNode]) -> dict[object, RigidTransform]:
+    globals_: dict[object, RigidTransform] = {}
+    for nd in order:
+        globals_[nd.name] = (
+            nd.local
+            if nd.parent is None
+            else _compose_global(globals_[nd.parent], nd.local)
+        )
+    return globals_
+
+
+def compute_global_pose(
+    nodes: Sequence[object],
+) -> dict[object, RigidTransform]:
+    """由局部姿态（局部刚体变换 + 父节点）求全局姿态。
+
+    参数
+    ----
+    nodes : 姿态节点序列，每项 PoseNode、(name, parent, local) 或等价 dict。
+        parent 为父节点的 name 或 None（根）。局部旋转四元数必须单位
+        （容差 QNORM_TOL）。节点数本身不设上限（skin_with_pose 沿用
+        skin 的 32 骨上限）。
+
+    返回
+    ----
+    dict[name, RigidTransform]，按拓扑序（父先于子）插入；全局变换为世界
+    系下的刚体变换。规范化规则固定：每次累乘后立即将旋转四元数单位化。
+
+    异常
+    ----
+    重复绑定（重名）、非法父节点（不存在）、自环、环 -> HierarchyError；
+    结构/数值非法 -> InvalidInputError；旋转非单位 -> NonRigidTransformError。
+    全部校验先于计算，失败不返回部分结果。
+    """
+    parsed = _parse_pose_nodes(nodes, "pose")
+    return _globals_from_order(_topo_sort(parsed, "pose"))
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
@@ -526,3 +692,55 @@ def skin(
         results.append(SkinResult(position=pos, normal=nrm))
 
     return results
+
+
+def skin_with_pose(
+    vertices: Sequence[object],
+    bind_pose: Sequence[object],
+    current_pose: Sequence[object],
+    weights: Sequence[object],
+) -> list[SkinResult]:
+    """局部姿态入口：拓扑排序求全局姿态后交给旧蒙皮入口 skin。
+
+    参数
+    ----
+    vertices     : 同 skin。
+    bind_pose    : 绑定姿态节点序列（PoseNode / (name, parent, local) / dict）。
+    current_pose : 当前姿态节点序列，节点名字集合必须与 bind_pose 一致；
+        父结构允许与绑定姿态不同（各自独立求全局姿态）。
+    weights      : 同 skin；骨骼下标对应 **bind_pose 的输入顺序**
+        （第 i 个下标即 bind_pose[i] 的节点）。
+
+    返回 / 异常
+    ----
+    同 skin。姿态自身的非法（重复绑定、非法父节点、环、非单位局部旋转、
+    绑定/当前名字集合不一致）在调用 skin 之前抛出；骨骼数上限（32）由
+    skin 继承。全部校验先于计算，失败不留下部分变更。
+    """
+    bind_nodes = _parse_pose_nodes(bind_pose, "bind_pose")
+    cur_nodes = _parse_pose_nodes(current_pose, "current_pose")
+    bind_globals = _globals_from_order(_topo_sort(bind_nodes, "bind_pose"))
+    cur_globals = _globals_from_order(_topo_sort(cur_nodes, "current_pose"))
+
+    bind_names = {nd.name for nd in bind_nodes}
+    cur_names = {nd.name for nd in cur_nodes}
+    if bind_names != cur_names:
+        only_bind = sorted(repr(n) for n in bind_names - cur_names)
+        only_cur = sorted(repr(n) for n in cur_names - bind_names)
+        raise HierarchyError(
+            "bind_pose/current_pose: 节点名字集合不一致"
+            f"（仅绑定侧 {only_bind}，仅当前侧 {only_cur}）"
+        )
+
+    # 全局姿态作为无父骨骼交给旧入口：skin 内部求得的
+    # M_i = W_current_i · W_bind_i⁻¹ 与全局语义一致。
+    bones = [
+        Bone(
+            name=nd.name,
+            parent=None,
+            bind=bind_globals[nd.name],
+            current=cur_globals[nd.name],
+        )
+        for nd in bind_nodes
+    ]
+    return skin(vertices, bones, weights)
