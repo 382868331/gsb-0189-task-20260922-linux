@@ -24,13 +24,19 @@ __all__ = [
     "RigidTransform",
     "Bone",
     "SkinResult",
+    "WeightDerivative",
+    "WeightSensitivity",
     "SkinError",
     "InvalidInputError",
     "HierarchyError",
     "NonRigidTransformError",
     "WeightError",
     "skin",
+    "weight_jacobian",
     "QNORM_TOL",
+    "WEIGHT_MARGIN_TOL",
+    "SIGN_DOT_TOL",
+    "REAL_NORM_MIN",
     "MAX_BONES",
 ]
 
@@ -40,6 +46,29 @@ MAX_BONES = 32
 # 单位四元数模长容差（相对）：|‖q‖ - 1| <= QNORM_TOL。
 # 这是“输入合法性”的判定口径，不是输出误差口径；超差即拒绝，不做静默归一化。
 QNORM_TOL = 1e-6
+
+# 权重敏感度（weight_jacobian）可微判定的显式阈值：
+#
+# WEIGHT_MARGIN_TOL —— 符号基准唯一性。归一化后最大权重与次大权重之差
+#   （(w1-w2)/Σw）必须严格大于该值；落在阈值内视为最大权重并列，
+#   符号基准会在权重微扰下切换，标记不可微。
+# SIGN_DOT_TOL —— 符号对齐点积离零距离。每个参与混合的骨骼实部与基准
+#   实部的内积绝对值必须严格大于该值；否则微扰可能跨越 dot=0 的整体
+#   翻转边界（skin 中 dot < 0 才翻转），标记不可微。
+# REAL_NORM_MIN —— 混合实部范数下限。归一化加权实部 R = Σ αᵢ sᵢ qrᵢ
+#   的范数必须严格大于该值；越接近零，正交化对权重微扰越敏感（双四元
+#   数混合的近抵消退化，归一化导数按 1/‖R‖、1/‖R‖² 放大），标记不可微；
+#   恰为零时位置本身无定义。
+#
+# 几何约束：符号对齐后每个 sᵢqrᵢ 与基准实部内积为正，故
+# ‖R‖ ≥ α_ref（最大归一化权重）；32 骨时理论下限约 1/32 ≈ 0.031。
+# 取 0.05 意味着只在“单骨主导（最大权重明显高于 1/20）”的配置下给
+# 出导数；多骨近切向铺开导致的近抵消区按不可微拒绝（详见 README）。
+#
+# 三个阈值均针对归一化权重（或与缩放无关的量），与权重整体缩放无关。
+WEIGHT_MARGIN_TOL = 1e-6
+SIGN_DOT_TOL = 1e-6
+REAL_NORM_MIN = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +120,36 @@ class SkinResult(NamedTuple):
 
     position: Vec3
     normal: Vec3
+
+
+class WeightDerivative(NamedTuple):
+    """位置对单个骨骼未归一化权重的局部导数。
+
+    bone_index —— 骨骼下标，与输入权重行中的 (bone_index, weight) 对应；
+        对未出现在权重行中的骨骼，位置恒不依赖其权重，导数为零向量。
+    d_position —— ∂position/∂w（对未归一化原始非负权重求导），Vec3。
+        满足缩放零方向：Σ_k w_k · (∂p/∂w_k) = 0（全体权重同倍缩放时
+        位置不变，链式法则给出该恒等式）。
+    """
+
+    bone_index: int
+    d_position: Vec3
+
+
+class WeightSensitivity(NamedTuple):
+    """单顶点权重敏感度查询结果。
+
+    differentiable —— 是否通过全部可微判定（基准唯一 / 点积离零 /
+        实部范数足够大）。False 时 derivatives 为空，reason 给出触发的
+        第一条原因（按基准、点积、范数顺序检查）。
+    reason —— 不可微原因（中文、可定位到顶点）；可微时为 None。
+    derivatives —— differentiable 为 True 时，对权重行中每一项给出
+        WeightDerivative，顺序与输入权重行一致；否则为空元组。
+    """
+
+    differentiable: bool
+    reason: str | None
+    derivatives: tuple[WeightDerivative, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +484,268 @@ def _dq_translation(qr: Quat, qd: Quat) -> Vec3:
 
 
 # ---------------------------------------------------------------------------
+# 骨架变换与逐顶点混合（skin 与 weight_jacobian 共用，不允许平行实现分叉）
+# ---------------------------------------------------------------------------
+
+
+def _skin_dual_quaternions(
+    parsed_bones: list[Bone],
+) -> list[tuple[Quat, Quat]]:
+    """世界变换（父链累乘）与蒙皮变换 M = W_cur * W_bind^{-1}，转双四元数。"""
+    nb = len(parsed_bones)
+
+    def _worlds(attr: str) -> list[RigidTransform]:
+        worlds: list[RigidTransform | None] = [None] * nb
+
+        def world(i: int) -> RigidTransform:
+            cached = worlds[i]
+            if cached is not None:
+                return cached
+            bone = parsed_bones[i]
+            local = getattr(bone, attr)
+            w = local if bone.parent is None else _compose(world(bone.parent), local)
+            worlds[i] = w
+            return w
+
+        for k in range(nb):
+            world(k)
+        return worlds  # type: ignore[return-value]
+
+    bind_world = _worlds("bind")
+    cur_world = _worlds("current")
+
+    return [
+        _rigid_to_dq(_compose(cur_world[i], _inverse(bind_world[i])))
+        for i in range(nb)
+    ]
+
+
+def _ref_bone(entries: list[tuple[int, float]]) -> int:
+    """符号基准：最大权重骨骼（并列取下标小者，确定性）。零权重也可作为
+    基准（与 skin 既有行为一致）；可微性由 WEIGHT_MARGIN_TOL 另行判定。"""
+    return max(entries, key=lambda e: (e[1], -e[0]))[0]
+
+
+def _blend_components(
+    entries: list[tuple[int, float]],
+    dqs: list[tuple[Quat, Quat]],
+    ref_idx: int,
+) -> tuple[list[float], list[float], list[float]]:
+    """按 skin 第 4 步做符号对齐与加权求和。
+
+    返回 (acc_qr, acc_qd, signs)：原始权重加权和（未归一化），以及每个
+    权重项实际使用的符号 sᵢ∈{+1,-1}（dot < 0 翻转，实部对偶部同号）。
+    """
+    ref_qr = dqs[ref_idx][0]
+    acc_qr = [0.0, 0.0, 0.0, 0.0]
+    acc_qd = [0.0, 0.0, 0.0, 0.0]
+    signs: list[float] = []
+    for bidx, w in entries:
+        qr, qd = dqs[bidx]
+        dot = (
+            qr.w * ref_qr.w + qr.x * ref_qr.x + qr.y * ref_qr.y + qr.z * ref_qr.z
+        )
+        s = -1.0 if dot < 0.0 else 1.0
+        signs.append(s)
+        if w == 0.0:
+            continue  # 零权重骨骼不影响结果（但符号仍记录，供导数使用）
+        acc_qr[0] += w * s * qr.w
+        acc_qr[1] += w * s * qr.x
+        acc_qr[2] += w * s * qr.y
+        acc_qr[3] += w * s * qr.z
+        acc_qd[0] += w * s * qd.w
+        acc_qd[1] += w * s * qd.x
+        acc_qd[2] += w * s * qd.y
+        acc_qd[3] += w * s * qd.z
+    return acc_qr, acc_qd, signs
+
+
+def _skin_vertex(
+    p: Vec3,
+    n: Vec3,
+    entries: list[tuple[int, float]],
+    dqs: list[tuple[Quat, Quat]],
+) -> SkinResult:
+    """skin 的逐顶点部分：符号基准、对齐求和、正交化、作用位置与法向。"""
+    ref_idx = _ref_bone(entries)
+    acc_qr, acc_qd, _ = _blend_components(entries, dqs, ref_idx)
+    uqr, uqd = _dq_normalize(Quat(*acc_qr), Quat(*acc_qd))
+    t = _dq_translation(uqr, uqd)
+    pos = _vadd(_qrot(uqr, p), t)
+    nrm = _qrot(uqr, n)
+    return SkinResult(position=pos, normal=nrm)
+
+
+# ---------------------------------------------------------------------------
+# 权重敏感度：位置对未归一化权重的解析局部导数
+# ---------------------------------------------------------------------------
+
+
+def _differentiability_checks(
+    vertex_path: str,
+    entries: list[tuple[int, float]],
+    dqs: list[tuple[Quat, Quat]],
+    ref_idx: int,
+    signs: list[float],
+    total: float,
+) -> str | None:
+    """按显式阈值判定局部可微性；不可微时返回中文原因，可微返回 None。
+
+    检查顺序：符号基准唯一性 -> 对齐点积离零 -> 混合实部范数足够大。
+    所有量均用归一化权重 αᵢ = wᵢ/Σw，与权重整体缩放无关。
+    """
+    # 1) 最大权重符号基准唯一：归一化后最大、次大权重差必须严格过阈。
+    order = sorted((w for _, w in entries), reverse=True)
+    margin = (order[0] - order[1]) / total if len(order) > 1 else 1.0
+    if not margin > WEIGHT_MARGIN_TOL:
+        return (
+            f"{vertex_path}: 最大权重并列（归一化权重差 {margin:.3e} "
+            f"<= {WEIGHT_MARGIN_TOL:.0e}），符号基准在权重微扰下不唯一，"
+            f"位置对权重不可微"
+        )
+
+    # 2) 每个参与骨骼的实部与基准实部点积必须离零（含零权重项：其权重
+    #    一旦增大即按该符号进入混合，边界处单侧导数不一致）。
+    ref_qr = dqs[ref_idx][0]
+    min_dot = math.inf
+    for bidx, _ in entries:
+        qr = dqs[bidx][0]
+        d = abs(qr.w * ref_qr.w + qr.x * ref_qr.x + qr.y * ref_qr.y + qr.z * ref_qr.z)
+        if d < min_dot:
+            min_dot = d
+    if not min_dot > SIGN_DOT_TOL:
+        return (
+            f"{vertex_path}: 存在骨骼实部与符号基准实部的对齐点积接近零"
+            f"（|dot| = {min_dot:.3e} <= {SIGN_DOT_TOL:.0e}），"
+            f"符号翻转切换边界上位置对权重不可微"
+        )
+
+    # 3) 归一化加权实部范数必须足够大，排除近抵消退化。
+    nrm2 = 0.0
+    for i in range(4):
+        comp = 0.0
+        for (bidx, w), s in zip(entries, signs):
+            comp += (w / total) * s * dqs[bidx][0][i]
+        nrm2 += comp * comp
+    nrm = math.sqrt(nrm2)
+    if not nrm > REAL_NORM_MIN:
+        return (
+            f"{vertex_path}: 混合实部范数 {nrm:.3e} <= {REAL_NORM_MIN:.0e}，"
+            f"双四元数近抵消退化区，正交化对权重微扰敏感，"
+            f"位置对权重不可微"
+        )
+    return None
+
+
+def _weight_derivatives(
+    p: Vec3,
+    entries: list[tuple[int, float]],
+    dqs: list[tuple[Quat, Quat]],
+    signs: list[float],
+) -> tuple[WeightDerivative, ...]:
+    """沿 skin 实际管线对未归一化权重求解析导数。
+
+    变量链（αᵢ = wᵢ/W，W = Σ wⱼ）：
+      R = Σ αᵢ sᵢ qrᵢ，  D = Σ αᵢ sᵢ qdᵢ，  n = ‖R‖，
+      q̂ = R/n，  q̂d = D/n − (<D,R>/n²) q̂，
+      p' = q̂(0,p)q̂* 的向量部 + 2·vec(q̂d ⊗ q̂*)。
+    ∂αᵢ/∂wₖ = (δᵢₖ − αᵢ)/W，故 Σₖ wₖ ∂p'/∂wₖ = 0（缩放零方向）。
+    """
+    total = sum(w for _, w in entries)
+    inv_total = 1.0 / total
+
+    # 归一化混合实部 R 与对偶部 D
+    R = [0.0, 0.0, 0.0, 0.0]
+    D = [0.0, 0.0, 0.0, 0.0]
+    for (bidx, w), s in zip(entries, signs):
+        qr, qd = dqs[bidx]
+        a = w * inv_total * s
+        R[0] += a * qr.w
+        R[1] += a * qr.x
+        R[2] += a * qr.y
+        R[3] += a * qr.z
+        D[0] += a * qd.w
+        D[1] += a * qd.x
+        D[2] += a * qd.y
+        D[3] += a * qd.z
+
+    n2 = R[0] * R[0] + R[1] * R[1] + R[2] * R[2] + R[3] * R[3]
+    n = math.sqrt(n2)
+    inv_n = 1.0 / n
+    qhat = Quat(R[0] * inv_n, R[1] * inv_n, R[2] * inv_n, R[3] * inv_n)
+
+    # q̂d = D/n − c·q̂，c = <D,R>/n²
+    dr = D[0] * R[0] + D[1] * R[1] + D[2] * R[2] + D[3] * R[3]
+    c = dr / n2
+    qhatd = Quat(
+        D[0] * inv_n - c * qhat.w,
+        D[1] * inv_n - c * qhat.x,
+        D[2] * inv_n - c * qhat.y,
+        D[3] * inv_n - c * qhat.z,
+    )
+
+    pq = Quat(0.0, p.x, p.y, p.z)
+    qhat_conj = _qconj(qhat)
+    pq_conj = _qmul(qhat, pq)  # q̂ ⊗ (0,p)，旋转第二项复用
+
+    derivatives: list[WeightDerivative] = []
+    for k, ((bidx, _), s_k) in enumerate(zip(entries, signs)):
+        qr_k, qd_k = dqs[bidx]
+
+        # ∂R/∂wₖ = (sₖ qrₖ − R)/W，∂D/∂wₖ = (sₖ qdₖ − D)/W
+        dR = [
+            (s_k * qr_k[i] - R[i]) * inv_total
+            for i in range(4)
+        ]
+        dD = [
+            (s_k * qd_k[i] - D[i]) * inv_total
+            for i in range(4)
+        ]
+
+        # ∂q̂/∂wₖ = (∂R − (<R,∂R>/n²) R) / n
+        rr = R[0] * dR[0] + R[1] * dR[1] + R[2] * dR[2] + R[3] * dR[3]
+        f = rr / n2
+        dq = Quat(
+            (dR[0] - f * R[0]) * inv_n,
+            (dR[1] - f * R[1]) * inv_n,
+            (dR[2] - f * R[2]) * inv_n,
+            (dR[3] - f * R[3]) * inv_n,
+        )
+
+        # ∂c/∂wₖ = (<∂D,R>+<D,∂R>)/n² − 2c·<R,∂R>/n²
+        ddr = (
+            dD[0] * R[0] + dD[1] * R[1] + dD[2] * R[2] + dD[3] * R[3]
+            + D[0] * dR[0] + D[1] * dR[1] + D[2] * dR[2] + D[3] * dR[3]
+        )
+        dc = ddr / n2 - 2.0 * c * rr / n2
+
+        # ∂q̂d/∂wₖ = ∂D/n − D/n·rr/n² − dc·q̂ − c·∂q̂
+        dqd = Quat(
+            dD[0] * inv_n - D[0] * rr / (n2 * n) - dc * qhat.w - c * dq.w,
+            dD[1] * inv_n - D[1] * rr / (n2 * n) - dc * qhat.x - c * dq.x,
+            dD[2] * inv_n - D[2] * rr / (n2 * n) - dc * qhat.y - c * dq.y,
+            dD[3] * inv_n - D[3] * rr / (n2 * n) - dc * qhat.z - c * dq.z,
+        )
+
+        # 位置 = vec(q̂⊗(0,p)⊗q̂*) + 2·vec(q̂d⊗q̂*)
+        rot1 = _qmul(_qmul(dq, pq), qhat_conj)
+        rot2 = _qmul(pq_conj, _qconj(dq))
+        tr1 = _qmul(dqd, qhat_conj)
+        tr2 = _qmul(qhatd, _qconj(dq))
+        derivatives.append(
+            WeightDerivative(
+                bone_index=bidx,
+                d_position=Vec3(
+                    rot1.x + rot2.x + 2.0 * (tr1.x + tr2.x),
+                    rot1.y + rot2.y + 2.0 * (tr1.y + tr2.y),
+                    rot1.z + rot2.z + 2.0 * (tr1.z + tr2.z),
+                ),
+            )
+        )
+    return tuple(derivatives)
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
@@ -465,64 +786,65 @@ def skin(
     parsed_bones = _parse_bones(bones)
     parsed_weights = _parse_weights(weights, len(parsed_verts), len(parsed_bones))
 
-    # ---- 世界变换（父链累乘）与蒙皮变换 M = W_cur * W_bind^{-1} ----
-    nb = len(parsed_bones)
-
-    def _worlds(attr: str) -> list[RigidTransform]:
-        worlds: list[RigidTransform | None] = [None] * nb
-
-        def world(i: int) -> RigidTransform:
-            cached = worlds[i]
-            if cached is not None:
-                return cached
-            bone = parsed_bones[i]
-            local = getattr(bone, attr)
-            w = local if bone.parent is None else _compose(world(bone.parent), local)
-            worlds[i] = w
-            return w
-
-        for k in range(nb):
-            world(k)
-        return worlds  # type: ignore[return-value]
-
-    bind_world = _worlds("bind")
-    cur_world = _worlds("current")
-
-    dqs: list[tuple[Quat, Quat]] = []
-    for i in range(nb):
-        m = _compose(cur_world[i], _inverse(bind_world[i]))
-        dqs.append(_rigid_to_dq(m))
+    # ---- 世界变换、蒙皮变换双四元数 ----
+    dqs = _skin_dual_quaternions(parsed_bones)
 
     # ---- 逐顶点混合 ----
-    results: list[SkinResult] = []
-    for vi, ((p, n), entries) in enumerate(zip(parsed_verts, parsed_weights)):
-        # 符号基准：最大权重骨骼（并列取下标小者，确定性）
-        ref_idx = max(entries, key=lambda e: (e[1], -e[0]))[0]
-        ref_qr = dqs[ref_idx][0]
+    return [
+        _skin_vertex(p, n, entries, dqs)
+        for (p, n), entries in zip(parsed_verts, parsed_weights)
+    ]
 
-        acc_qr = [0.0, 0.0, 0.0, 0.0]
-        acc_qd = [0.0, 0.0, 0.0, 0.0]
-        for bidx, w in entries:
-            if w == 0.0:
-                continue  # 零权重骨骼不影响结果（也不参与符号判断）
-            qr, qd = dqs[bidx]
-            dot = (
-                qr.w * ref_qr.w + qr.x * ref_qr.x + qr.y * ref_qr.y + qr.z * ref_qr.z
-            )
-            s = -1.0 if dot < 0.0 else 1.0
-            acc_qr[0] += w * s * qr.w
-            acc_qr[1] += w * s * qr.x
-            acc_qr[2] += w * s * qr.y
-            acc_qr[3] += w * s * qr.z
-            acc_qd[0] += w * s * qd.w
-            acc_qd[1] += w * s * qd.x
-            acc_qd[2] += w * s * qd.y
-            acc_qd[3] += w * s * qd.z
 
-        uqr, uqd = _dq_normalize(Quat(*acc_qr), Quat(*acc_qd))
-        t = _dq_translation(uqr, uqd)
-        pos = _vadd(_qrot(uqr, p), t)
-        nrm = _qrot(uqr, n)
-        results.append(SkinResult(position=pos, normal=nrm))
+def weight_jacobian(
+    vertex: object,
+    bones: Sequence[object],
+    weight_row: Sequence[object],
+) -> WeightSensitivity:
+    """查询单个顶点位置对原始（未归一化）非负骨骼权重的局部导数。
 
-    return results
+    导数严格沿 ``skin`` 的实际管线求取：权重归一化 αᵢ=wᵢ/Σw、最大权重
+    符号基准与实部内积负则双部同号翻转、加权双四元数单位化（实部归一
+    + 对偶部正交化），再对旋转和平移作用链求导。**不是**对简化线性
+    混合模型（LBS）求导。
+
+    参数
+    ----
+    vertex : (position, normal)，与 skin 单项顶点同构（normal 仍须非零，
+        导数只针对位置，但输入口径与 skin 保持一致）。
+    bones  : 与 skin 相同的骨骼序列。
+    weight_row : 单顶点权重行 [(bone_index, weight), ...]，规则同 skin：
+        有限非负、下标不重复、总权 > 0。
+
+    返回
+    ----
+    WeightSensitivity。仅当三个显式条件同时成立时给出导数：
+      1. 最大权重符号基准唯一：归一化最大/次大权重差 > WEIGHT_MARGIN_TOL；
+      2. 每个权重项骨骼实部与基准实部的 |点积| > SIGN_DOT_TOL；
+      3. 归一化混合实部范数 > REAL_NORM_MIN。
+    任一不满足：``differentiable=False``，``derivatives=()``，``reason``
+    说明落在哪个切换/退化边界。导数针对未归一化权重，因此
+    ``Σ_k w_k·d_position_k = 0``（全体权重同倍缩放方向导数为零）。
+
+    异常
+    ----
+    输入非法时与 skin 抛出相同的 SkinError 子类（可定位），不返回结果。
+    """
+    # 与 skin 同一套校验先行（逐顶点版本）
+    p, n = _parse_vertex(vertex, "vertex")
+    parsed_bones = _parse_bones(bones)
+    entries = _parse_weights([weight_row], 1, len(parsed_bones))[0]
+
+    dqs = _skin_dual_quaternions(parsed_bones)
+    ref_idx = _ref_bone(entries)
+    _, _, signs = _blend_components(entries, dqs, ref_idx)
+    total = sum(w for _, w in entries)
+
+    reason = _differentiability_checks(
+        "weight_row", entries, dqs, ref_idx, signs, total
+    )
+    if reason is not None:
+        return WeightSensitivity(False, reason, ())
+
+    derivatives = _weight_derivatives(p, entries, dqs, signs)
+    return WeightSensitivity(True, None, derivatives)

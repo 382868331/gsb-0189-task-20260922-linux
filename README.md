@@ -1,7 +1,8 @@
 # dqskin — 双四元数骨骼蒙皮与绑定修正
 
 离线角色变形工程的可复用模块：对一批顶点执行双四元数蒙皮
-（Dual-Quaternion Skinning, DQS），含绑定姿态修正。
+（Dual-Quaternion Skinning, DQS），含绑定姿态修正；并提供单顶点
+**权重敏感度**查询（蒙皮位置对原始未归一化骨骼权重的解析局部导数）。
 
 - **Python 版本**：3.14.7（仅标准库，零第三方依赖，`requirements.txt` 为空注释）
 - **运行环境**：Linux 原生；核心、测试、演示全部离线，无需网络/账号/数据库/Docker
@@ -10,9 +11,11 @@
 ## 接口
 
 ```python
-from dqskin import skin, Bone, RigidTransform, Quat, Vec3
+from dqskin import skin, weight_jacobian
+from dqskin import Bone, RigidTransform, Quat, Vec3
 
-results = skin(vertices, bones, weights)  # -> list[SkinResult]
+results = skin(vertices, bones, weights)          # -> list[SkinResult]
+sens = weight_jacobian(vertex, bones, weight_row) # -> WeightSensitivity
 ```
 
 ### 数据结构
@@ -24,6 +27,8 @@ results = skin(vertices, bones, weights)  # -> list[SkinResult]
 | `RigidTransform` | `rotation: Quat, translation: Vec3` | 刚体变换：先旋转后平移，`p' = R·p + t` |
 | `Bone` | `name, parent, bind, current` | `parent` 为父骨骼下标（int）或 `None`（根）；`bind`/`current` 为绑定/当前**局部**刚体变换 |
 | `SkinResult` | `position: Vec3, normal: Vec3` | 蒙皮输出 |
+| `WeightDerivative` | `bone_index: int, d_position: Vec3` | 位置对该骨骼**未归一化**权重的局部导数 |
+| `WeightSensitivity` | `differentiable: bool, reason: str\|None, derivatives: tuple[WeightDerivative, ...]` | 单顶点敏感度查询结果；不可微时 `derivatives=()` 且 `reason` 说明边界 |
 
 `vertices`：每项 `(position, normal)`，长度 3 的有限数值序列；`normal` 必须非零。
 `bones`：每项 `Bone`、`(name, parent, bind, current)` 元组或等价 dict。
@@ -39,6 +44,48 @@ results = skin(vertices, bones, weights)  # -> list[SkinResult]
    实部与对偶部**同号翻转**；加权求和；
 5. 单位双四元数正交化（归一化实部并扣除对偶部漂移，强制 `<qr,qd>=0`）；
 6. 用结果变换位置（旋转+平移）与法向（仅旋转，不平移）。
+
+## 权重敏感度 `weight_jacobian`
+
+`weight_jacobian(vertex, bones, weight_row) -> WeightSensitivity` 返回单个
+顶点蒙皮位置对**原始未归一化非负权重** wₖ 的局部导数 ∂p/∂wₖ（三维向量，
+对权重行中每项给出一个，`bone_index` 与顺序跟随输入行；未出现在行中的
+骨骼位置恒不依赖其权重，视为零导数）。
+
+导数**严格沿上述 DQS 管线求取**，不是对简化线性混合模型（LBS）求导：
+
+1. 归一化 αᵢ = wᵢ/W，W = Σwⱼ，故 ∂αᵢ/∂wₖ = (δᵢₖ − αᵢ)/W；
+2. 沿用最大权重骨骼符号基准与 `dot < 0` 实部/对偶部同号翻转（局部常量分支）；
+3. 对加权实部/对偶部、实部归一化与对偶部正交化、
+   `p' = Rot(q̂)p + 2·vec(q̂d⊗q̂*)` 整条链做解析微分。
+
+由链式法则自动满足**缩放零方向**：`Σₖ wₖ·∂p/∂wₖ = 0`，即全体权重同倍
+缩放的方向导数为零（测试验证到 1e-9）。`skin` 与本查询共用同一套世界
+变换、混合与正交化代码，不存在分叉的平行实现。
+
+### 可微判定（显式阈值，落在切换边界标 nondifferentiable 并给原因）
+
+只有三个条件**全部**严格成立时才返回导数，否则
+`differentiable=False`、`derivatives=()`、`reason` 给出触发的第一条原因：
+
+| 常量 | 值 | 条件 | 挡住的不可微情形 |
+|---|---|---|---|
+| `WEIGHT_MARGIN_TOL` | `1e-6` | 归一化最大权重与次大权重之差 `(w₁−w₂)/Σw` 严格大于该值 | 最大权重并列：符号基准在权重微扰下切换 |
+| `SIGN_DOT_TOL` | `1e-6` | 权重行中每个骨骼实部与基准实部的内积绝对值严格大于该值 | 对齐点积为零：权重微扰跨过整体符号翻转边界 |
+| `REAL_NORM_MIN` | `0.05` | 归一化加权实部 `R=Σαᵢsᵢqrᵢ` 的范数严格大于该值 | 双四元数近抵消退化：正交化按 1/‖R‖、1/‖R‖² 放大微扰；‖R‖=0 时位置本身无定义 |
+
+判定全部基于归一化权重或与缩放无关的量，因此与权重整体缩放无关。
+`REAL_NORM_MIN=0.05` 的可达性说明：符号对齐后每个 `sᵢqrᵢ` 与基准实部
+内积为正，故 `‖R‖ ≥ α_ref`（最大归一化权重），32 骨时理论下限约
+`1/32≈0.031`；阈值 0.05 意味着只在"单骨主导"配置下给出导数——多骨
+旋转在基准半球切向铺开导致的近抵消（需接近 32 骨上限才可能进入
+0.05 以下）按不可微拒绝。测试用 32 骨构造（基准近 180°、其余 31 骨
+旋转轴在垂直平面均匀铺开使向量部和为零）实际触发该分支。
+
+边界处的数学注记：`skin` 在平局时取下标小者（基准选择对 w 是分段常量）、
+在点积为零时取不翻转（`dot < 0` 才翻转），位置在这些超曲面上连续但
+通常存在两条单侧导数，因此不冒充可微；wₖ=0 本身不是切换点（权重域
+边界，单侧方向导数良定义，只要对应骨骼点积离零），解析导数照常返回。
 
 ## 输入上限
 
@@ -64,13 +111,21 @@ results = skin(vertices, bones, weights)  # -> list[SkinResult]
 **原子性**：全部校验先于任何计算；任一输入非法即抛异常，不返回部分结果。
 `skin` 为纯函数，无内部状态、不改写输入，失败不会留下部分变更。
 本模块不含搜索/证明流程，因此不存在"预算耗尽"与"无解"的分支。
+`weight_jacobian` 复用完全相同的解析与校验（单顶点口径）：负权、零总权、
+空权重行、下标越界/重复、零法向、非刚体、层级非法同样抛出上述异常；
+而"落在切换/退化边界"**不是异常**，是正常返回的
+`WeightSensitivity(differentiable=False, reason=...)`。
 
 ## 误差口径
 
 - 双精度浮点计算；测试容差：解析参考 `1e-9`，180° 附近混合 `1e-6`；
 - 权重整体缩放（正数）结果不变（测试验证到 `1e-9`）；
 - 法向长度在蒙皮前后守恒（纯旋转）；
-- `QNORM_TOL` 是**输入合法性**口径，不是输出误差口径。
+- `QNORM_TOL` 是**输入合法性**口径，不是输出误差口径；
+- 权重导数在安全邻域与 `skin` 黑箱中心差分（h=1e-6）比对：
+  旋转/平移混合、不等权三骨案例最大偏差 ≤ 1e-7（平移线性案例 ≤ 1e-9）；
+  缩放零方向 Σwₖ∂p/∂wₖ 验证到 1e-9；单骨导数解析为零（机器精度 1e-12）。
+  中心差分自身的截断/舍入量级（约 1e-7~1e-10）即核对上限，不另放宽。
 
 ## 设计取舍与已知限制
 
@@ -78,18 +133,29 @@ results = skin(vertices, bones, weights)  # -> list[SkinResult]
 - 混合是"最短路径"球面混合：两骨骼旋转相差恰好 180° 时，等权混合的实部
   理论上退化到范数为零附近，结果对权重微扰敏感（DQS 固有限制，非实现缺陷）；
 - 每顶点骨骼影响数未设上限（受 32 骨总数约束）；
+- 权重敏感度只覆盖**位置对权重**的局部导数：不含法向导数、不含对骨骼姿态
+  （旋转/平移参数）的导数，不做骨骼姿态求解器或任何学习/优化系统；
+- 敏感度是局部一阶量：平局、点积过零、实部近抵消三类切换/退化边界返回
+  `nondifferentiable` 而非给一个无意义的数字；阈值（1e-6/1e-6/0.05）是
+  显式工程口径，写死为模块常量，边界紧邻处的中心差分同样不可靠，
+  不应把阈值理解为精确的数学分界；
 - 只实现本题契约的刚体+DQS 子集，不宣称兼容任何完整行业标准（如 glTF 蒙皮）；
 - 不实现动画编辑器、不读写文件格式。
 
 ## 命令
 
 ```bash
-python -m unittest discover -s tests -v   # 运行全部测试
-python demo.py                            # 演示（约 1 秒）
+python -m unittest discover -s tests -v   # 运行全部测试（51 个）
+python demo.py                            # 演示（约 1 秒，实测 < 0.1 秒）
 ```
 
 `demo.py` 真实计算并打印：扭转区域（两骨 ±150° 等权）DQS 半径保持 ≈1 而
-LBS 对照塌陷到 ≈0.866，以及一个实际触发的负权重拒绝。
+LBS 对照塌陷到 ≈0.866，一个实际触发的负权重拒绝；随后用三骨不等权
+（旋转+平移混合）案例打印每个权重的解析导数与中心差分对照、缩放零方向、
+一阶预测，并实际触发"最大权重平局"与"对齐点积为零"两个不可微边界。
 
-测试期望值来自解析手算与 `tests/refimpl.py` 中独立的矩阵实现
-（不调用 `dqskin`），往返一致性仅作补充。
+测试期望值来自解析手算（含同向骨骼平移线性的导数闭式
+∂p/∂wₖ=(tₖ−t̄)/W、单骨导数为零）、`tests/refimpl.py` 中独立的矩阵实现
+（不调用 `dqskin`），以及对公开 `skin` 的黑箱中心/单侧差分；
+往返一致性仅作补充。此外用 400 组随机骨架（层级、随机刚体变换、零权重）
+核对重构后的 `skin` 与归档版本输出逐位一致（max abs diff = 0.0）。
