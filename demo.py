@@ -1,4 +1,4 @@
-"""dqskin 演示：扭转区域双四元数蒙皮 vs 线性混合，以及错误输入拒绝。
+"""dqskin 演示：扭转区域双四元数蒙皮 vs 线性混合、权重敏感度查询，以及错误输入拒绝。
 
 固定输入、确定性计算、离线运行（约 1 秒内完成）。
 """
@@ -7,7 +7,15 @@ from __future__ import annotations
 
 import math
 
-from dqskin import Bone, Quat, RigidTransform, Vec3, WeightError, skin
+from dqskin import (
+    Bone,
+    Quat,
+    RigidTransform,
+    Vec3,
+    WeightError,
+    skin,
+    skin_weight_sensitivity,
+)
 
 
 def quat_axis_angle(axis, angle):
@@ -78,6 +86,54 @@ def main() -> None:
         print("（意外）未触发拒绝")
     except WeightError as exc:
         print(f"已拒绝 -> WeightError: {exc}")
+
+    # ---- 权重敏感度：三骨骼（旋转+平移混合，不等权）----
+    print()
+    print("=== 权重敏感度：三骨骼（旋转+平移，不等权 0.5/0.3/0.2）===")
+    bones3 = [
+        Bone("b0", None, ident,
+             RigidTransform(quat_axis_angle((0, 0, 1), 0.9), Vec3(1.0, 0.0, 0.0))),
+        Bone("b1", None, ident,
+             RigidTransform(quat_axis_angle((0, 1, 0), -0.7), Vec3(0.0, 2.0, 1.0))),
+        Bone("b2", None, ident,
+             RigidTransform(quat_axis_angle((1, 0, 0), 0.4), Vec3(-1.0, 0.5, 2.0))),
+    ]
+    pos3 = (0.3, -0.7, 1.1)
+    w3 = [(0, 0.5), (1, 0.3), (2, 0.2)]
+    sens = skin_weight_sensitivity(pos3, bones3, w3)
+    p = sens.position
+    print(f"位置 = ({p.x:+.6f}, {p.y:+.6f}, {p.z:+.6f})（与 skin 输出一致）")
+    print("雅可比 ∂position/∂w_j（对未归一化原始权重）:")
+    for j, col in enumerate(sens.jacobian):
+        print(f"  J[{j}] = ({col.x:+.6f}, {col.y:+.6f}, {col.z:+.6f})")
+
+    # 中心差分独立核对（安全邻域，h = 1e-6）
+    h = 1e-6
+    max_err = 0.0
+    for j in range(len(w3)):
+        wp = [list(e) for e in w3]
+        wm = [list(e) for e in w3]
+        wp[j][1] += h
+        wm[j][1] -= h
+        pp = skin([(pos3, (0, 0, 1))], bones3, [wp])[0].position
+        pm = skin([(pos3, (0, 0, 1))], bones3, [wm])[0].position
+        for k in range(3):
+            cd = (pp[k] - pm[k]) / (2.0 * h)
+            max_err = max(max_err, abs(cd - sens.jacobian[j][k]))
+    print(f"中心差分核对：最大偏差 {max_err:.3e}（应 < 1e-6）")
+
+    # 全体权重同倍缩放方向的方向导数 Σ w_j·J[j] 应为零
+    euler = [sum(w3[j][1] * sens.jacobian[j][k] for j in range(3)) for k in range(3)]
+    print(f"缩放方向导数 Σ w_j·J[j] = ({euler[0]:+.2e}, {euler[1]:+.2e}, {euler[2]:+.2e})（应≈0）")
+
+    # ---- 切换边界：等权扭转顶点不可微 ----
+    print()
+    print("=== 切换边界：等权（0.5/0.5）扭转顶点 ===")
+    edge = skin_weight_sensitivity((0.0, 1.0, 0.0), bones, [(0, 0.5), (1, 0.5)])
+    print(f"differentiable = {edge.differentiable}")
+    print(f"原因: {edge.nondifferentiable_reason}")
+    ep = edge.position
+    print(f"位置仍返回 = ({ep.x:+.6f}, {ep.y:+.6f}, {ep.z:+.6f})")
 
 
 if __name__ == "__main__":
