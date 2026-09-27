@@ -397,6 +397,149 @@ class TestRejections(unittest.TestCase):
             skin(verts, bones, weights)
 
 
+class TestTangent(unittest.TestCase):
+    """切线与法向同为方向量：只旋转、长度守恒、相互关系保持、改号不翻转。"""
+
+    def test_single_bone_tangent_analytic(self):
+        # 绕 z 转 90°：位置、法向、切线都精确旋转；切线 (0,1,0) -> (-1,0,0)
+        bones = [Bone("b", None, IDENT, rigid((0, 0, 1), math.pi / 2))]
+        vert = ((1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+        (res,) = skin([vert], bones, [[(0, 1.0)]])
+        assert_vec_close(self, res.position, (0.0, 1.0, 0.0))
+        assert_vec_close(self, res.normal, (0.0, 1.0, 0.0))
+        assert_vec_close(self, res.tangent, (-1.0, 0.0, 0.0))
+
+    def test_translation_does_not_affect_tangent(self):
+        bones = [Bone("b", None, IDENT, rigid((1, 2, 3), 0.8, (5.0, -3.0, 2.0)))]
+        tangent = (0.3, -0.7, 1.1)
+        RT = refimpl.rigid_from_axis_angle((1, 2, 3), 0.8, (5.0, -3.0, 2.0))
+        (res,) = skin(
+            [((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), tangent)], bones, [[(0, 1.0)]]
+        )
+        assert_vec_close(self, res.tangent, refimpl.rigid_rotate(RT, tangent))
+
+    def test_tangent_length_preserved_single(self):
+        m = rigid((1, 2, 3), 1.3, (4.0, 5.0, 6.0))
+        bones = [Bone("b", None, IDENT, m)]
+        tangent = (0.0, 0.0, 2.5)
+        (res,) = skin(
+            [((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), tangent)], bones, [[(0, 1.0)]]
+        )
+        tlen = math.sqrt(sum(c * c for c in res.tangent))
+        self.assertAlmostEqual(tlen, 2.5, delta=1e-9)
+
+    def test_orthogonal_normal_tangent_stay_orthogonal_blended(self):
+        # 混合骨骼：混合后的双四元数仍是刚体旋转，正交关系必须保持
+        m1 = rigid((0, 0, 1), 1.0, (1.0, 0.0, 0.0))
+        m2 = rigid((0, 1, 0), -0.6, (0.0, 2.0, 1.0))
+        bones = [Bone("a", None, IDENT, m1), Bone("b", None, IDENT, m2)]
+        normal = (0.0, 0.0, 1.0)
+        tangent = (1.0, 0.0, 0.0)  # 与法向正交
+        (res,) = skin(
+            [((0.3, 0.7, -0.2), normal, tangent)], bones, [[(0, 0.4), (1, 0.6)]]
+        )
+        nlen = math.sqrt(sum(c * c for c in res.normal))
+        tlen = math.sqrt(sum(c * c for c in res.tangent))
+        self.assertAlmostEqual(nlen, 1.0, delta=1e-9)
+        self.assertAlmostEqual(tlen, 1.0, delta=1e-9)
+        dot = sum(a * b for a, b in zip(res.normal, res.tangent))
+        self.assertAlmostEqual(dot, 0.0, delta=1e-9)
+
+    def test_tangent_length_preserved_blended(self):
+        # 非单位长度切线：混合后长度仍守恒（纯旋转，无平移贡献）
+        m1 = rigid((1, 0, 0), 0.9, (3.0, 0.0, 0.0))
+        m2 = rigid((0, 1, 0), 0.5, (0.0, -2.0, 1.0))
+        bones = [Bone("a", None, IDENT, m1), Bone("b", None, IDENT, m2)]
+        tangent = (0.2, -0.4, 0.8)
+        scale = math.sqrt(sum(c * c for c in tangent))
+        (res,) = skin(
+            [((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), tangent)],
+            bones,
+            [[(0, 0.3), (1, 0.7)]],
+        )
+        tlen = math.sqrt(sum(c * c for c in res.tangent))
+        self.assertAlmostEqual(tlen, scale, delta=1e-9)
+
+    def test_sign_flipped_bone_same_tangent(self):
+        # 骨骼旋转以 -q 表示（实际旋转相同），切线结果不得突然翻转。
+        # 混合两骨，其中一骨整体改号；与未改号版本逐分量一致。
+        q1 = quat_axis_angle((0, 1, 0), 0.7)
+        q2 = quat_axis_angle((1, 0, 1), -0.4)
+        t1, t2 = Vec3(1.0, 0.0, 0.0), Vec3(0.0, 1.0, 0.0)
+        vert = ((0.4, -0.2, 0.9), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
+        w = [[(0, 0.55), (1, 0.45)]]
+
+        bones_a = [
+            Bone("a", None, IDENT, RigidTransform(q1, t1)),
+            Bone("b", None, IDENT, RigidTransform(q2, t2)),
+        ]
+        bones_b = [
+            Bone("a", None, IDENT, RigidTransform(Quat(-q1.w, -q1.x, -q1.y, -q1.z), t1)),
+            Bone("b", None, IDENT, RigidTransform(Quat(-q2.w, -q2.x, -q2.y, -q2.z), t2)),
+        ]
+        res_a = skin([vert], bones_a, w)[0]
+        res_b = skin([vert], bones_b, w)[0]
+        assert_vec_close(self, res_b.position, res_a.position)
+        assert_vec_close(self, res_b.normal, res_a.normal)
+        assert_vec_close(self, res_b.tangent, res_a.tangent)
+
+    def test_antipodal_same_rotation_tangent(self):
+        # q 与 -q 同旋转混合（180° 附近符号基准），切线必须按该旋转变换
+        q = quat_axis_angle((0, 0, 1), 2.0)
+        mq = Quat(-q.w, -q.x, -q.y, -q.z)
+        bones = [
+            Bone("a", None, IDENT, RigidTransform(q, Vec3(1.0, 0.0, 0.0))),
+            Bone("b", None, IDENT, RigidTransform(mq, Vec3(1.0, 0.0, 0.0))),
+        ]
+        tangent = (0.0, 1.0, 0.0)
+        (res,) = skin(
+            [((1.0, 2.0, 3.0), (0.0, 0.0, 1.0), tangent)],
+            bones,
+            [[(0, 0.5), (1, 0.5)]],
+        )
+        RT = refimpl.rigid_from_axis_angle((0, 0, 1), 2.0, (1.0, 0.0, 0.0))
+        assert_vec_close(self, res.tangent, refimpl.rigid_rotate(RT, tangent))
+
+    def test_near_180_blend_tangent_short_path(self):
+        # 179°/181° 等权：切线 (1,0,0) 应走短路径 -> (-1,0,0)，不翻转回 +x
+        bones = [
+            Bone("a", None, IDENT, rigid((0, 0, 1), math.radians(179.0))),
+            Bone("b", None, IDENT, rigid((0, 0, 1), math.radians(181.0))),
+        ]
+        (res,) = skin(
+            [((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0))],
+            bones,
+            [[(0, 1.0), (1, 1.0)]],
+        )
+        assert_vec_close(self, res.tangent, (-1.0, 0.0, 0.0), tol=1e-6)
+
+    def test_tangent_optional_and_zero_rejected(self):
+        bones = [Bone("b", None, IDENT, rigid((0, 0, 1), 0.3))]
+        # 不提供切线 -> tangent 为 None，旧用法保持兼容
+        (res,) = skin([((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))], bones, [[(0, 1.0)]])
+        self.assertIsNone(res.tangent)
+        # 零切线必须被拒绝且路径可定位
+        with self.assertRaises(InvalidInputError) as cm:
+            skin(
+                [((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 0.0))],
+                bones,
+                [[(0, 1.0)]],
+            )
+        self.assertIn("vertices[0].tangent", str(cm.exception))
+
+    def test_weight_scaling_invariant_with_tangent(self):
+        m1 = rigid((0, 0, 1), 1.0, (1.0, 0.0, 0.0))
+        m2 = rigid((0, 1, 0), -0.6, (0.0, 2.0, 1.0))
+        bones = [Bone("a", None, IDENT, m1), Bone("b", None, IDENT, m2)]
+        vert = [((0.3, 0.7, -0.2), (1.0, 0.0, 0.0), (0.0, 1.0, 0.2))]
+        base = skin(vert, bones, [[(0, 0.3), (1, 0.7)]])[0]
+        for scale in (1e-3, 137.5):
+            scaled = skin(
+                vert, bones, [[(0, 0.3 * scale), (1, 0.7 * scale)]]
+            )[0]
+            assert_vec_close(self, scaled.tangent, base.tangent, tol=1e-9)
+
+
 class TestOutputContract(unittest.TestCase):
     def test_result_types_and_count(self):
         bones = [Bone("b", None, IDENT, rigid((0, 0, 1), 0.3))]
