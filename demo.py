@@ -49,7 +49,7 @@ def main() -> None:
              RigidTransform(quat_axis_angle((1, 0, 0), -twist), Vec3(0, 0, 0))),
     ]
     # 顶点位于轴外半径 1 处（x=0 截面上 y=1），法向沿 +y
-    vertices = [((0.0, 1.0, 0.0), (0.0, 1.0, 0.0))]
+    vertices = [((0.0, 1.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0))]
     weights = [[(0, 0.5), (1, 0.5)]]
 
     (res,) = skin(vertices, bones, weights)
@@ -66,6 +66,7 @@ def main() -> None:
     print("=== 正常结果：扭转区域（两骨 ±150°，等权）===")
     print(f"DQS 位置 = ({res.position.x:+.6f}, {res.position.y:+.6f}, {res.position.z:+.6f})")
     print(f"DQS 法向 = ({res.normal.x:+.6f}, {res.normal.y:+.6f}, {res.normal.z:+.6f})")
+    print(f"DQS 切线 = ({res.tangent.x:+.6f}, {res.tangent.y:+.6f}, {res.tangent.z:+.6f})")
     print(f"DQS 半径（应≈1，不塌陷）: {dqs_radius:.6f}")
     print(f"LBS 位置 = ({lbs[0]:+.6f}, {lbs[1]:+.6f}, {lbs[2]:+.6f})")
     print(f"LBS 半径（塌陷对照）     : {lbs_radius:.6f}")

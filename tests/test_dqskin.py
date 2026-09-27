@@ -101,6 +101,43 @@ class TestSingleBoneAnalytic(unittest.TestCase):
             assert_vec_close(self, res.position, p)
             assert_vec_close(self, res.normal, n)
 
+    def test_tangent_rotation_and_translation_independence(self):
+        bones = [Bone("b", None, IDENT, rigid((0, 0, 1), math.pi / 2, (5, -3, 2)))]
+        (res,) = skin(
+            [((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 2.0))],
+            bones,
+            [[(0, 1.0)]],
+        )
+        assert_vec_close(self, res.position, (5.0, -2.0, 2.0))
+        assert_vec_close(self, res.normal, (-1.0, 0.0, 0.0))
+        assert_vec_close(self, res.tangent, (0.0, 0.0, 2.0))
+
+    def test_tangent_bind_correction(self):
+        bind = rigid((0, 0, 1), math.pi / 2)
+        cur = rigid((0, 0, 1), math.pi)
+        bones = [Bone("b", None, bind, cur)]
+        (res,) = skin(
+            [((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0))],
+            bones,
+            [[(0, 1.0)]],
+        )
+        assert_vec_close(self, res.normal, (-1.0, 0.0, 0.0))
+        assert_vec_close(self, res.tangent, (0.0, 1.0, 0.0))
+
+    def test_negative_quaternion_does_not_flip_directions(self):
+        angle = 0.8
+        positive = rigid((0.0, 1.0, 0.0), angle, (3.0, -1.0, 2.0))
+        q = positive.rotation
+        negative = RigidTransform(
+            Quat(-q.w, -q.x, -q.y, -q.z), positive.translation
+        )
+        vertex = ((1.5, -2.0, 0.5), (0.0, 0.0, 1.0), (1.0, 1.0, 0.0))
+        positive_result = skin([vertex], [Bone("b", None, IDENT, positive)], [[(0, 1.0)]])
+        negative_result = skin([vertex], [Bone("b", None, IDENT, negative)], [[(0, 1.0)]])
+        assert_vec_close(self, negative_result[0].position, positive_result[0].position)
+        assert_vec_close(self, negative_result[0].normal, positive_result[0].normal)
+        assert_vec_close(self, negative_result[0].tangent, positive_result[0].tangent)
+
 
 class TestCoDirectionalBones(unittest.TestCase):
     """同向骨骼：旋转相同的骨骼混合，旋转不变、平移按权重线性。"""
@@ -141,6 +178,57 @@ class TestCoDirectionalBones(unittest.TestCase):
         assert_vec_close(self, res.position, refimpl.rigid_apply(RT, p))
         assert_vec_close(self, res.normal, refimpl.rigid_rotate(RT, n))
 
+    def test_blended_tangent_matches_reference_and_preserves_frame(self):
+        m1 = rigid((0, 0, 1), 0.7, (1.0, 2.0, 0.5))
+        m2 = rigid((0, 1, 0), -0.5, (-2.0, 0.0, 1.5))
+        bones = [Bone("a", None, IDENT, m1), Bone("b", None, IDENT, m2)]
+        p, n, tangent = (0.4, -0.9, 1.2), (0.0, 0.0, 1.0), (1.0, 2.0, 0.0)
+        (res,) = skin([(p, n, tangent)], bones, [[(0, 0.35), (1, 0.65)]])
+
+        def length(v):
+            return math.sqrt(sum(c * c for c in v))
+
+        def dot(a, b):
+            return sum(a[i] * b[i] for i in range(3))
+
+        def cross(a, b):
+            return (
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            )
+
+        self.assertAlmostEqual(length(res.tangent), length(tangent), delta=1e-9)
+        self.assertAlmostEqual(
+            dot(res.normal, res.tangent), dot(n, tangent), delta=1e-9
+        )
+        binormal = cross(res.normal, res.tangent)
+        self.assertAlmostEqual(
+            length(binormal), length(n) * length(tangent), delta=1e-9
+        )
+        self.assertAlmostEqual(dot(binormal, res.normal), 0.0, delta=1e-9)
+        self.assertAlmostEqual(dot(binormal, res.tangent), 0.0, delta=1e-9)
+
+        basis = skin(
+            [
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                ((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            ],
+            bones,
+            [[(0, 0.35), (1, 0.65)]] * 3,
+        )
+        columns = [tuple(r.normal) for r in basis]
+        determinant = sum(
+            columns[0][i]
+            * (
+                columns[1][(i + 1) % 3] * columns[2][(i + 2) % 3]
+                - columns[1][(i + 2) % 3] * columns[2][(i + 1) % 3]
+            )
+            for i in range(3)
+        )
+        self.assertAlmostEqual(determinant, 1.0, delta=1e-9)
+
 
 class TestNear180(unittest.TestCase):
     """180° 附近：符号翻转与最短路径混合。"""
@@ -155,11 +243,12 @@ class TestNear180(unittest.TestCase):
             Bone("a", None, IDENT, RigidTransform(q, t)),
             Bone("b", None, IDENT, RigidTransform(mq, t)),
         ]
-        p, n = (1.0, 2.0, 3.0), (0.0, 0.0, 1.0)
-        (res,) = skin([(p, n)], bones, [[(0, 0.5), (1, 0.5)]])
+        p, n, tangent = (1.0, 2.0, 3.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)
+        (res,) = skin([(p, n, tangent)], bones, [[(0, 0.5), (1, 0.5)]])
         RT = refimpl.rigid_from_axis_angle((0, 0, 1), 2.0, (1.0, 0.0, 0.0))
         assert_vec_close(self, res.position, refimpl.rigid_apply(RT, p))
         assert_vec_close(self, res.normal, refimpl.rigid_rotate(RT, n))
+        assert_vec_close(self, res.tangent, refimpl.rigid_rotate(RT, tangent))
 
     def test_blend_across_180_takes_short_path(self):
         # 两骨分别绕 z 转 179° 与 181°（即 -179°），等权混合应得 ~180°，
@@ -189,22 +278,24 @@ class TestWeightScalingInvariance(unittest.TestCase):
         m1 = rigid((0, 0, 1), 1.0, (1.0, 0.0, 0.0))
         m2 = rigid((0, 1, 0), -0.6, (0.0, 2.0, 1.0))
         bones = [Bone("a", None, IDENT, m1), Bone("b", None, IDENT, m2)]
-        vert = [((0.3, 0.7, -0.2), (1.0, 0.0, 0.0))]
+        vert = [((0.3, 0.7, -0.2), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))]
         base = skin(vert, bones, [[(0, 0.3), (1, 0.7)]])[0]
         for scale in (1e-3, 2.0, 137.5):
             scaled = skin(vert, bones, [[(0, 0.3 * scale), (1, 0.7 * scale)]])[0]
             assert_vec_close(self, scaled.position, base.position, tol=1e-9)
             assert_vec_close(self, scaled.normal, base.normal, tol=1e-9)
+            assert_vec_close(self, scaled.tangent, base.tangent, tol=1e-9)
 
     def test_zero_weight_bone_ignored(self):
         m1 = rigid((0, 0, 1), 0.5)
         m2 = rigid((1, 0, 0), 2.0, (9.0, 9.0, 9.0))
         bones = [Bone("a", None, IDENT, m1), Bone("b", None, IDENT, m2)]
-        vert = [((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))]
+        vert = [((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))]
         with_zero = skin(vert, bones, [[(0, 1.0), (1, 0.0)]])[0]
         without = skin(vert, bones, [[(0, 1.0)]])[0]
         assert_vec_close(self, with_zero.position, without.position)
         assert_vec_close(self, with_zero.normal, without.normal)
+        assert_vec_close(self, with_zero.tangent, without.tangent)
 
 
 class TestHierarchy(unittest.TestCase):
@@ -388,6 +479,12 @@ class TestRejections(unittest.TestCase):
         with self.assertRaises(InvalidInputError):
             skin([((0, 0, 0), (0, 0, 0))], bones, [[(0, 1.0)]])
 
+    def test_zero_tangent_rejected(self):
+        bones = [Bone("b", None, IDENT, IDENT)]
+        with self.assertRaises(InvalidInputError) as cm:
+            skin([((0, 0, 0), (0, 0, 1), (0, 0, 0))], bones, [[(0, 1.0)]])
+        self.assertIn("vertices[0].tangent", str(cm.exception))
+
     def test_no_partial_results_on_failure(self):
         # 第二个顶点非法 -> 整体抛错，不返回任何结果
         bones = [Bone("b", None, IDENT, IDENT)]
@@ -407,6 +504,12 @@ class TestOutputContract(unittest.TestCase):
             self.assertIsInstance(r, SkinResult)
             self.assertIsInstance(r.position, Vec3)
             self.assertIsInstance(r.normal, Vec3)
+            self.assertIsNone(r.tangent)
+
+    def test_tangent_result_type(self):
+        bones = [Bone("b", None, IDENT, IDENT)]
+        (res,) = skin([((0, 0, 0), (0, 0, 1), (1, 0, 0))], bones, [[(0, 1.0)]])
+        self.assertIsInstance(res.tangent, Vec3)
 
     def test_inputs_not_mutated(self):
         bones = [Bone("b", None, IDENT, rigid((0, 0, 1), 0.3))]

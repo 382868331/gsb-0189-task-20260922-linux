@@ -8,7 +8,7 @@
 - 蒙皮矩阵 M_i = W_current_i * inverse(W_bind_i)。
 - 双四元数 dq = qr + eps * qd，qd = 0.5 * (0, t) ⊗ qr。
 - 顶点混合：以最大权重骨骼的实部为符号基准，实部内积为负的骨骼整体翻转
-  （实部与对偶部同号翻转），加权求和后单位化（正交化），再作用于位置与法向。
+  （实部与对偶部同号翻转），加权求和后单位化（正交化），再作用于位置、法向与切线。
 
 所有校验在计算前完成：任一输入非法时抛出异常，不返回部分结果。
 """
@@ -91,6 +91,7 @@ class SkinResult(NamedTuple):
 
     position: Vec3
     normal: Vec3
+    tangent: Vec3 | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -193,17 +194,30 @@ def _parse_rigid(value: object, where: str) -> RigidTransform:
     return RigidTransform(q, t)
 
 
-def _parse_vertex(vertex: object, where: str) -> tuple[Vec3, Vec3]:
-    if not (isinstance(vertex, (tuple, list)) and len(vertex) == 2):
+def _parse_direction(value: object, where: str) -> Vec3:
+    direction = _parse_vec3(value, where)
+    length = math.sqrt(
+        direction.x * direction.x
+        + direction.y * direction.y
+        + direction.z * direction.z
+    )
+    if length == 0.0:
+        raise InvalidInputError(f"{where}: 方向为零向量，无法蒙皮")
+    return direction
+
+
+def _parse_vertex(vertex: object, where: str) -> tuple[Vec3, Vec3, Vec3 | None]:
+    if not (isinstance(vertex, (tuple, list)) and len(vertex) in (2, 3)):
         raise InvalidInputError(
-            f"{where}: 需要 (position, normal) 二元组，得到 {vertex!r}"
+            f"{where}: 需要 (position, normal) 或 (position, normal, tangent)，"
+            f"得到 {vertex!r}"
         )
     p = _parse_vec3(vertex[0], f"{where}.position")
-    n = _parse_vec3(vertex[1], f"{where}.normal")
-    nlen = math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z)
-    if nlen == 0.0:
-        raise InvalidInputError(f"{where}.normal: 法向为零向量，无法蒙皮")
-    return p, n
+    n = _parse_direction(vertex[1], f"{where}.normal")
+    tangent = None
+    if len(vertex) == 3:
+        tangent = _parse_direction(vertex[2], f"{where}.tangent")
+    return p, n, tangent
 
 
 def _parse_bones(bones: object) -> list[Bone]:
@@ -438,8 +452,9 @@ def skin(
 
     参数
     ----
-    vertices : 长度 V 的序列，每项 (position, normal)；position/normal 为
-        长度 3 的有限数值序列（或 Vec3）。normal 必须非零。
+    vertices : 长度 V 的序列，每项为 (position, normal) 或
+        (position, normal, tangent)；各向量为长度 3 的有限数值序列（或 Vec3）。
+        normal 必须非零；提供 tangent 时 tangent 也必须非零。
     bones    : 长度 1..32 的骨骼序列，每项 Bone 或
         (name, parent, bind, current)。parent 为父骨骼下标或 None（根）。
         bind/current 为 RigidTransform 或 (quat, vec3)；旋转四元数必须
@@ -449,7 +464,7 @@ def skin(
 
     返回
     ----
-    list[SkinResult]，长度 V，与输入顶点一一对应。
+    list[SkinResult]，长度 V，与输入顶点一一对应。未提供切线时 tangent 为 None。
 
     异常
     ----
@@ -495,7 +510,9 @@ def skin(
 
     # ---- 逐顶点混合 ----
     results: list[SkinResult] = []
-    for vi, ((p, n), entries) in enumerate(zip(parsed_verts, parsed_weights)):
+    for vi, ((p, n, tangent), entries) in enumerate(
+        zip(parsed_verts, parsed_weights)
+    ):
         # 符号基准：最大权重骨骼（并列取下标小者，确定性）
         ref_idx = max(entries, key=lambda e: (e[1], -e[0]))[0]
         ref_qr = dqs[ref_idx][0]
@@ -523,6 +540,7 @@ def skin(
         t = _dq_translation(uqr, uqd)
         pos = _vadd(_qrot(uqr, p), t)
         nrm = _qrot(uqr, n)
-        results.append(SkinResult(position=pos, normal=nrm))
+        tan = _qrot(uqr, tangent) if tangent is not None else None
+        results.append(SkinResult(position=pos, normal=nrm, tangent=tan))
 
     return results
